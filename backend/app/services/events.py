@@ -1,0 +1,416 @@
+from datetime import datetime
+from typing import Annotated
+from uuid import UUID
+
+from app.core.config import settings
+from app.db.models import (
+    Event,
+    EventBanner,
+    EventSeat,
+    FavoriteEvent,
+    Review,
+    SeatType,
+    Ticket,
+    TicketStatus,
+    User,
+)
+from app.db.session import DBSession
+from app.dto.analytics import AgencyAnalyticsResponse, AgencyEventAnalyticsResponse
+from app.dto.events import (
+    BannerResponse,
+    EventFilterParams,
+    EventRequest,
+    EventResponse,
+)
+from app.services.dependencies import StorageServiceDep
+from app.util.files import (
+    get_banner_key,
+    to_image_response,
+)
+from fastapi import Depends, HTTPException, UploadFile, status
+from fastapi.responses import StreamingResponse
+from fastapi_pagination import Page, Params, create_page
+from sqlmodel import case, col, delete, func, select
+
+
+class EventService:
+    def __init__(self, db: DBSession, storage_service: StorageServiceDep):
+        self.db = db
+        self.storage_service = storage_service
+
+    def get_event(
+        self, event_id: int, current_user: User | None = None
+    ) -> EventResponse:
+        db_event = self.db.get(Event, event_id)
+
+        if not db_event:
+            raise HTTPException(status.HTTP_404_NOT_FOUND)
+
+        return self._event_to_response(db_event, current_user)
+
+    def list_events(
+        self,
+        params: Params,
+        filters: EventFilterParams,
+        current_user: User | None = None,
+    ) -> Page[EventResponse]:
+        # 1. Base Query
+        query = select(Event)
+
+        # 2. Apply Filters
+        if filters.q:
+            query = query.where(
+                (col(Event.title).ilike(f"%{filters.q}%"))
+                | (col(Event.description).ilike(f"%{filters.q}%"))
+            )
+
+        # Category Filter (Supports Multiple Selection using IN)
+        if filters.category:
+            query = query.where(col(Event.category).in_(filters.category))
+
+        # City Filter
+        if filters.city:
+            query = query.where(col(Event.city).ilike(f"%{filters.city}%"))
+
+        # Date Range Filter
+        if filters.start_date:
+            query = query.where(Event.starts_at >= filters.start_date)
+        if filters.end_date:
+            query = query.where(Event.starts_at <= filters.end_date)
+
+        # Price Range Filter
+        if filters.min_price is not None:
+            query = query.where(Event.ticket_price >= filters.min_price)
+        if filters.max_price is not None:
+            query = query.where(Event.ticket_price <= filters.max_price)
+
+        # Free/Paid Filter
+        if filters.is_free is not None:
+            if filters.is_free:
+                query = query.where(Event.ticket_price == 0)
+            else:
+                query = query.where(Event.ticket_price > 0)
+
+        # 3. Calculate Total
+        total = self.db.exec(select(func.count()).select_from(query.subquery())).one()
+
+        # 4. Pagination
+        offset = (params.page - 1) * params.size
+        db_events = self.db.exec(query.offset(offset).limit(params.size)).all()
+
+        # 5. Map to Response
+        events: list[EventResponse] = [
+            self._event_to_response(event, current_user) for event in db_events
+        ]
+
+        return create_page(events, total, params)
+
+    def list_agency_events(self, params: Params, agency: User) -> Page[EventResponse]:
+        total = self.db.exec(
+            select(func.count()).select_from(Event).where(Event.creator_id == agency.id)
+        ).one()
+        offset = (params.page - 1) * params.size
+
+        db_events = self.db.exec(
+            select(Event)
+            .where(Event.creator_id == agency.id)
+            .offset(offset)
+            .limit(params.size)
+        ).all()
+
+        events: list[EventResponse] = [
+            self._event_to_response(event, agency) for event in db_events
+        ]
+
+        return create_page(events, total, params)
+
+    def create_event(self, agency: User, request: EventRequest) -> EventResponse:
+        if request.starts_at <= datetime.now():
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Event start time must be in the future",
+            )
+
+        if request.starts_at >= request.ends_at:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Event start time must be before end time",
+            )
+
+        if request.vip_seats_count > request.total_seats:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "VIP seats count cannot exceed total seats"
+            )
+
+        if request.vip_ticket_price < request.ticket_price:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "VIP ticket price must be greater than or equal to regular ticket price",
+            )
+
+        event = Event(**request.model_dump())
+        event.creator = agency
+
+        self.db.add(event)
+        self.db.flush()
+        self.db.refresh(event)
+
+        assert event.id is not None
+
+        vip_seats: list[EventSeat] = [
+            EventSeat(event_id=event.id, seat_number=i + 1, seat_type=SeatType.VIP)
+            for i in range(event.vip_seats_count)
+        ]
+
+        regular_seats: list[EventSeat] = [
+            EventSeat(event_id=event.id, seat_number=i + 1, seat_type=SeatType.REGULAR)
+            for i in range(event.vip_seats_count, event.total_seats)
+        ]
+
+        self.db.add_all(vip_seats)
+        self.db.add_all(regular_seats)
+        self.db.commit()
+
+        return self._event_to_response(event)
+
+    def update_event(
+        self, event_id: int, request: EventRequest, agency: User
+    ) -> EventResponse:
+        event = self.db.exec(select(Event).where(Event.id == event_id)).first()
+
+        if not event:
+            raise HTTPException(status.HTTP_404_NOT_FOUND)
+
+        if event.creator_id != agency.id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN)
+
+        event.sqlmodel_update(request.model_dump(exclude_unset=True))
+
+        self.db.add(event)
+        self.db.commit()
+        self.db.refresh(event)
+
+        return self._event_to_response(event)
+
+    def delete_event(self, event_id: int, agency: User):
+        event = self.db.get(Event, event_id)
+
+        if not event:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
+
+        if event.creator_id != agency.id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Not authorized")
+
+        # Delete dependent rows in a safe order (no cascade configured)
+        self.db.exec(delete(Review).where(Review.event_id == event_id))  # type:ignore[call-overload]
+
+        # delete tickets
+        self.db.exec(delete(Ticket).where(Ticket.event_id == event_id))  # type:ignore[call-overload]
+
+        # delete favorites
+        self.db.exec(delete(FavoriteEvent).where(FavoriteEvent.event_id == event_id))  # type:ignore[call-overload]
+
+        # delete seats
+        self.db.exec(delete(EventSeat).where(EventSeat.event_id == event_id))  # type:ignore[call-overload]
+
+        # delete banners and their files
+        for banner in event.banners:
+            key = get_banner_key(banner.id)
+            self.storage_service.delete(key)
+        self.db.exec(delete(EventBanner).where(EventBanner.event_id == event_id))  # type:ignore[call-overload]
+
+        # delete the event
+        self.db.delete(event)
+        self.db.commit()
+
+    def get_banner(self, banner_id: UUID) -> StreamingResponse:
+        banner = self.db.get(EventBanner, banner_id)
+
+        if not banner:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Banner not found")
+
+        key = get_banner_key(banner_id)
+        banner = self.storage_service.get(key)
+        return to_image_response(banner)
+
+    def upload_banner(
+        self, event_id: int, file: UploadFile, agency: User
+    ) -> BannerResponse:
+        event = self.db.get(Event, event_id)
+
+        if not event:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
+
+        if event.creator_id != agency.id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Not authorized")
+
+        if len(event.banners) == settings.MAX_BANNERS_PER_EVENT:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Banner limit reached")
+
+        banner = EventBanner(event_id=event_id)
+
+        key = get_banner_key(banner.id)
+        self.storage_service.put(file, key)
+
+        self.db.add(banner)
+        self.db.commit()
+
+        return BannerResponse(id=banner.id)
+
+    def delete_banner(self, event_id: int, banner_id: UUID, agency: User):
+        event = self.db.get(Event, event_id)
+
+        if not event:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Event not found")
+
+        if event.creator_id != agency.id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Not authorized")
+
+        banner = self.db.get(EventBanner, banner_id)
+
+        if not banner:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Banner not found")
+
+        if banner.event_id != event_id:
+            # return 404 to avoid info leak
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Banner not found")
+
+        key = get_banner_key(banner_id)
+        self.storage_service.delete(key)
+
+        self.db.delete(banner)
+        self.db.commit()
+
+    def get_agency_analytics(self, agency: User) -> AgencyAnalyticsResponse:
+        """Get aggregated analytics for all agency events."""
+        # Count total, active, and past events
+        total_events_count = self.db.exec(
+            select(func.count()).where(Event.creator_id == agency.id)
+        ).one()
+
+        # Calculate tickets sold and revenue
+        # Join to EventSeat to determine ticket pricing based on seat type
+        tickets_sold_stmt = (
+            select(
+                func.count(Ticket.id),  # type: ignore
+                func.sum(
+                    case(
+                        (
+                            EventSeat.seat_type == SeatType.VIP,
+                            Event.vip_ticket_price,
+                        ),
+                        else_=Event.ticket_price,
+                    )
+                ),
+            )
+            .select_from(Ticket)
+            .join(Event, Ticket.event_id == Event.id)  # type: ignore
+            .join(
+                EventSeat,
+                (EventSeat.event_id == Ticket.event_id)  # type: ignore
+                & (EventSeat.seat_number == Ticket.seat_number),  # type: ignore
+            )
+            .where(Event.creator_id == agency.id)
+            .where(Ticket.status == TicketStatus.CONFIRMED)
+        )
+
+        total_tickets_sold, total_revenue = self.db.exec(tickets_sold_stmt).one()
+
+        return AgencyAnalyticsResponse(
+            total_events=int(total_events_count or 0),
+            total_tickets_sold=int(total_tickets_sold or 0),
+            total_revenue=float(total_revenue or 0.0),
+        )
+
+    def list_agency_events_analytics(
+        self, agency: User
+    ) -> list[AgencyEventAnalyticsResponse]:
+        """Get per-event analytics for all agency events."""
+        # Select event details and aggregate ticket data
+        # Join to EventSeat to determine ticket pricing based on seat type
+        stmt = (
+            select(
+                Event.id,
+                func.count(Ticket.id),  # type: ignore
+                func.sum(
+                    case(
+                        (
+                            EventSeat.seat_type == SeatType.VIP,
+                            Event.vip_ticket_price,
+                        ),
+                        else_=Event.ticket_price,
+                    )
+                ),
+            )
+            .select_from(Event)
+            .outerjoin(
+                Ticket,
+                (Ticket.event_id == Event.id)  # type: ignore
+                & (Ticket.status == TicketStatus.CONFIRMED),  # type: ignore
+            )
+            .outerjoin(
+                EventSeat,
+                (EventSeat.event_id == Event.id)  # type: ignore
+                & (EventSeat.seat_number == Ticket.seat_number),  # type: ignore
+            )
+            .where(Event.creator_id == agency.id)
+            .group_by(Event.id, Event.title, Event.total_seats)  # type: ignore
+        )
+
+        rows = self.db.exec(stmt).all()
+        results: list[AgencyEventAnalyticsResponse] = []
+
+        for event_id, tickets_sold, revenue in rows:
+            if event_id is None:
+                continue
+
+            tickets_sold_count = int(tickets_sold or 0)
+
+            results.append(
+                AgencyEventAnalyticsResponse(
+                    event_id=int(event_id),
+                    tickets_sold=tickets_sold_count,
+                    revenue=float(revenue or 0.0),
+                )
+            )
+
+        return results
+
+    def _event_to_response(
+        self,
+        event: Event,
+        current_user: User | None = None,
+    ) -> EventResponse:
+        is_favorited = False
+
+        if current_user:
+            fav_result = self.db.exec(
+                select(FavoriteEvent)
+                .where(FavoriteEvent.event_id == event.id)
+                .where(FavoriteEvent.user_id == current_user.id)
+            ).first()
+
+            is_favorited = fav_result is not None
+
+        return EventResponse(
+            banner_ids=[banner.id for banner in event.banners],
+            average_rating=self._calculate_average_rating(event),
+            is_favorited=is_favorited,
+            **event.model_dump(),
+        )
+
+    def _calculate_average_rating(self, event: Event) -> float:
+        avg_rating_result = self.db.exec(
+            select(func.avg(Review.rating)).where(Review.event_id == event.id)
+        ).first()
+
+        return float(avg_rating_result) if avg_rating_result else 0.0
+
+
+def get_event_service(
+    db: DBSession, storage_service: StorageServiceDep
+) -> EventService:
+    return EventService(db, storage_service)
+
+
+EventServiceDep = Annotated[EventService, Depends(get_event_service)]

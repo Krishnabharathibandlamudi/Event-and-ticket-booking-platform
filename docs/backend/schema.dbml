@@ -1,0 +1,101 @@
+Project reservita {
+  database_type: 'SQLite'
+}
+
+Enum seat_type {
+  regular
+  vip
+}
+
+Enum event_category {
+  sports
+  theater
+  conference
+  comedy
+  other
+}
+
+Enum ticket_status {
+  confirmed
+  cancelled
+}
+
+Table user {
+  id integer [pk, increment]
+  full_name varchar [not null]
+  email varchar [unique, not null]
+  hashed_password varchar [not null]
+  phone_number varchar [not null]
+  is_agency boolean [not null, default: false]
+  
+  indexes {
+    email [unique]
+  }
+}
+
+Table event {
+  id integer [pk, increment]
+  title varchar [not null]
+  description text [not null]
+  category event_category [not null, default: 'other']
+  city varchar [not null]
+  venue varchar [not null]
+  address varchar [not null]
+  starts_at timestamp [not null]
+  ends_at timestamp [not null]
+  ticket_price float [not null]
+  vip_ticket_price float [not null]
+  creator_id integer [not null, ref: > user.id]
+  total_seats integer [not null, default: 100]
+  vip_seats_count integer [not null, default: 10]
+  
+  indexes {
+    title
+    category
+    city
+    starts_at
+    ends_at
+  }
+}
+
+Table eventbanner {
+  id uuid [pk]
+  event_id integer [not null, ref: > event.id]
+}
+
+Table eventseat {
+  event_id integer [pk, ref: > event.id]
+  seat_number integer [pk]
+  seat_type seat_type [not null, default: 'regular']
+}
+
+Table ticket {
+  id integer [pk, increment]
+  user_id integer [not null, ref: > user.id]
+  event_id integer [not null, ref: > event.id]
+  seat_number integer [not null]
+  qr_code varchar [not null]
+  status ticket_status [not null, default: 'confirmed']
+  purchased_at timestamp [not null, default: `now()`]
+  cancelled_at timestamp [null]
+  
+  indexes {
+    (event_id, seat_number) [unique, name: 'idx_unique_confirmed_seat']
+    status
+  }
+}
+
+Table review {
+  id integer [pk, increment]
+  ticket_id integer [unique, not null, ref: - ticket.id]
+  user_id integer [not null, ref: > user.id]
+  event_id integer [not null, ref: > event.id]
+  rating float [not null]
+  comment text [null]
+  created_at timestamp [not null, default: `now()`]
+}
+
+Table favoriteevent {
+  user_id integer [pk, ref: > user.id]
+  event_id integer [pk, ref: > event.id]
+}

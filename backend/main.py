@@ -1,0 +1,48 @@
+from app.api.auth import router as auth_router
+from app.api.events import router as events_router
+from app.api.favorites import router as favorites_router
+from app.api.health import router as health_router
+from app.api.my_events import router as my_events_router
+from app.api.reviews import router as reviews_router
+from app.api.tickets import router as tickets_router
+from app.api.users import router as users_router
+from app.core.config import settings
+from app.db.session import init_db
+from fastapi import FastAPI
+from fastapi_pagination import add_pagination
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI(title="Ticket Reservation API")
+add_pagination(app)
+
+routers = [
+    auth_router,
+    users_router,
+    events_router,
+    my_events_router,
+    tickets_router,
+    reviews_router,
+    favorites_router,
+]
+for router in routers:
+    app.include_router(router, prefix=settings.API_V1_STR)
+
+app.include_router(health_router)
+
+origins = [
+    "http://127.0.0.1:8080",
+    "https://bahaaio.github.io",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
